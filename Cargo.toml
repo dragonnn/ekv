@@ -42,6 +42,7 @@ log = ["dep:log", "std"]
 defmt = ["dep:defmt"]
 
 crc = []
+alloc = []
 
 ### FEATURES FOR TESTING ONLY. NOT COVERED BY SEMVER.
 

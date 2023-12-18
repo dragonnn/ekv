@@ -224,6 +224,10 @@ pub struct ReadTransaction<'a, F: Flash + 'a, M: RawMutex + 'a> {
 
 impl<'a, F: Flash + 'a, M: RawMutex + 'a> Drop for ReadTransaction<'a, F, M> {
     fn drop(&mut self) {
+        #[cfg(feature = "alloc")]
+        if let Ok(mut inner) = self.db.inner.try_lock() {
+            inner.readers[0].dealloc();
+        }
         self.db.state.lock(|s| {
             let s = &mut s.borrow_mut();
 
@@ -906,6 +910,11 @@ impl<F: Flash> Inner<F> {
         }
 
         tx.commit().await?;
+
+        #[cfg(feature = "alloc")]
+        for reader in &mut self.readers {
+            reader.dealloc();
+        }
 
         Ok(())
     }

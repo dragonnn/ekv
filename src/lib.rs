@@ -7,8 +7,11 @@
 #![allow(clippy::new_without_default)]
 // the `_test` feature makes public more stuff, causing bogus warnings.
 #![cfg_attr(not(feature = "_test"), warn(missing_docs))]
+#[cfg(feature = "alloc")]
+extern crate alloc as system_alloc;
 
 // MUST go first.
+
 mod fmt;
 mod macros;
 

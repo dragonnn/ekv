@@ -1,6 +1,9 @@
 use core::marker::PhantomData;
 use core::mem::size_of;
 
+#[cfg(feature = "alloc")]
+use system_alloc::boxed::Box;
+
 use crate::config::*;
 use crate::errors::Error;
 use crate::flash::Flash;
@@ -171,6 +174,9 @@ pub struct PageReader {
     chunk_pos: usize,
 
     /// Data in the current chunk.
+    #[cfg(feature = "alloc")]
+    buf: Option<Box<[u8; MAX_CHUNK_SIZE]>>,
+    #[cfg(not(feature = "alloc"))]
     buf: [u8; MAX_CHUNK_SIZE],
 }
 
@@ -187,6 +193,9 @@ impl PageReader {
                 chunk_crc: 0,
             },
             chunk_pos: 0,
+            #[cfg(feature = "alloc")]
+            buf: None,
+            #[cfg(not(feature = "alloc"))]
             buf: [0u8; MAX_CHUNK_SIZE],
         }
     }
@@ -209,18 +218,28 @@ impl PageReader {
     async fn load_chunk<F: Flash>(&mut self, flash: &mut F) -> Result<(), Error<F::Error>> {
         self.chunk_pos = 0;
         let n = align_up(self.ch.chunk_len);
+
+        #[cfg(feature = "alloc")]
+        let buf = {
+            if self.buf.is_none() {
+                self.buf = Some(Box::new([0u8; MAX_CHUNK_SIZE]));
+            }
+            unsafe { self.buf.as_mut().unwrap_unchecked() }
+        };
+        #[cfg(not(feature = "alloc"))]
+        let buf = &mut self.buf;
         flash
             .read(
                 self.ch.page_id as _,
                 self.ch.chunk_offset + ChunkHeader::SIZE,
-                &mut self.buf[..n],
+                &mut buf[..n],
             )
             .await
             .map_err(Error::Flash)?;
 
         #[cfg(feature = "crc")]
         {
-            let got_crc = crc32(&self.buf[..self.ch.chunk_len]);
+            let got_crc = crc32(&buf[..self.ch.chunk_len]);
             if got_crc != self.ch.chunk_crc {
                 return Err(Error::Corrupted);
             }
@@ -243,6 +262,7 @@ impl PageReader {
 
     pub async fn read<F: Flash>(&mut self, flash: &mut F, data: &mut [u8]) -> Result<usize, Error<F::Error>> {
         trace!("PageReader({:?}): read({})", self.ch.page_id, data.len());
+
         if self.ch.at_end || data.is_empty() {
             trace!("read: at end or zero len");
             return Ok(0);
@@ -255,11 +275,22 @@ impl PageReader {
                 return Ok(0);
             }
         }
+        #[cfg(feature = "alloc")]
+        let buf = {
+            if self.buf.is_none() {
+                self.buf = Some(Box::new([0u8; MAX_CHUNK_SIZE]));
+            }
+            unsafe { self.buf.as_mut().unwrap_unchecked() }
+        };
+
+        #[cfg(not(feature = "alloc"))]
+        let buf = &mut self.buf;
 
         let n = data.len().min(self.ch.chunk_len - self.chunk_pos);
-        data[..n].copy_from_slice(&self.buf[self.chunk_pos..][..n]);
+        data[..n].copy_from_slice(&buf[self.chunk_pos..][..n]);
         self.chunk_pos += n;
         trace!("read: done, n={}", n);
+
         Ok(n)
     }
 
@@ -293,6 +324,11 @@ impl PageReader {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn dealloc(&mut self) {
+        self.buf = None;
     }
 }
 
