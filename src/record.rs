@@ -925,6 +925,8 @@ impl<F: Flash> Inner<F> {
 
         tx.commit().await?;
 
+        drop(r);
+
         #[cfg(feature = "alloc")]
         for reader in &mut self.readers {
             reader.dealloc();
