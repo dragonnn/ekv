@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 // must go first
 mod fmt;
@@ -155,7 +155,7 @@ async fn main(_spawner: Spawner) -> ! {
         let key = make_key(i);
         let val = make_value(i);
 
-        let mut rtx = db.read_transaction().await;
+        let rtx = db.read_transaction().await;
         let n = rtx.read(&key, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], &val[..]);
     }

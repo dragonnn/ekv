@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 use defmt::*;
 use ekv::flash::{self, PageID};
@@ -86,7 +86,7 @@ async fn main(_spawner: Spawner) {
     wtx.write(b"HELLO", b"WORLD").await.unwrap();
     wtx.commit().await.unwrap();
 
-    let mut rtx = db.read_transaction().await;
+    let rtx = db.read_transaction().await;
     let mut buf = [0u8; 32];
     let hello = rtx.read(b"HELLO", &mut buf).await.map(|n| &buf[..n]).ok();
     if let Some(s) = hello {

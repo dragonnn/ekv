@@ -1,9 +1,7 @@
 use core::cell::RefCell;
 use core::cmp::Ordering;
 use core::future::poll_fn;
-use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
-use core::slice;
 use core::task::Poll;
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
@@ -13,11 +11,11 @@ use embassy_sync::waitqueue::WakerRegistration;
 use heapless::Vec;
 
 use crate::config::*;
-use crate::errors::{CorruptedError, Error, MountError, ReadError, WriteError};
+use crate::errors::{no_eof, CorruptedError, Error, MountError, ReadError, WriteError};
 use crate::file::{FileID, FileManager, FileReader, FileSearcher, FileWriter, SeekDirection, PAGE_MAX_PAYLOAD_SIZE};
 use crate::flash::Flash;
 use crate::page::{PageReader, ReadError as PageReadError};
-use crate::{CommitError, FormatError};
+use crate::{Bound, CommitError, Cursor, FormatError};
 
 const FILE_FLAG_COMPACT_DEST: u8 = 0x01;
 const FILE_FLAG_COMPACT_SRC: u8 = 0x02;
@@ -65,7 +63,7 @@ struct State {
 pub struct Database<F: Flash, M: RawMutex> {
     state: BlockingMutex<M, RefCell<State>>,
 
-    inner: Mutex<M, Inner<F>>,
+    pub(crate) inner: Mutex<M, Inner<F>>,
 }
 
 impl<F: Flash, M: RawMutex> Database<F, M> {
@@ -99,7 +97,7 @@ impl<F: Flash, M: RawMutex> Database<F, M> {
     /// Note that actually writing to the flash behind `ekv`'s back will result
     /// in corruption. This is intended for other tasks, for example
     /// reading the flash memory's serial number, or statistics.
-    pub async fn lock_flash(&self) -> impl Deref<Target = F> + DerefMut + '_ {
+    pub async fn lock_flash(&self) -> impl DerefMut<Target = F> + '_ {
         FlashLockGuard(self.inner.lock().await)
     }
 
@@ -245,12 +243,34 @@ impl<'a, F: Flash + 'a, M: RawMutex + 'a> ReadTransaction<'a, F, M> {
     /// Read a key from the database.
     ///
     /// The value is stored in the `value` buffer, and the length is returned.
-    pub async fn read(&mut self, key: &[u8], value: &mut [u8]) -> Result<usize, ReadError<F::Error>> {
+    pub async fn read(&self, key: &[u8], value: &mut [u8]) -> Result<usize, ReadError<F::Error>> {
         if key.len() > MAX_KEY_SIZE {
             return Err(ReadError::KeyTooBig);
         }
 
         self.db.inner.lock().await.read(key, value).await
+    }
+
+    /// Get a cursor for reading all the keys in the database.
+    ///
+    /// This is equivalent to calling `read_range(None, None)`.
+    ///
+    /// The cursor returns the keys in lexicographically ascending order.
+    pub async fn read_all<'b>(&'b self) -> Result<Cursor<'b, F, M>, Error<F::Error>> {
+        self.read_range(None, None).await
+    }
+
+    /// Get a cursor for reading keys in the database that are between `lower_bound` and `upper_bound`.
+    ///
+    /// A `None` bound indicates no upper or lower bound.
+    ///
+    /// The cursor returns the keys in lexicographically ascending order.
+    pub async fn read_range<'b>(
+        &'b self,
+        lower_bound: Option<Bound<'_>>,
+        upper_bound: Option<Bound<'b>>,
+    ) -> Result<Cursor<'b, F, M>, Error<F::Error>> {
+        Cursor::new(self.db, lower_bound, upper_bound).await
     }
 }
 
@@ -383,9 +403,9 @@ impl<'a, F: Flash + 'a, M: RawMutex + 'a> WriteTransaction<'a, F, M> {
     }
 }
 
-struct Inner<F: Flash> {
-    files: FileManager<F>,
-    readers: [PageReader; BRANCHING_FACTOR],
+pub(crate) struct Inner<F: Flash> {
+    pub(crate) files: FileManager<F>,
+    pub(crate) readers: [PageReader; BRANCHING_FACTOR],
     write_tx: Option<WriteTransactionInner>,
 }
 
@@ -428,16 +448,16 @@ impl<F: Flash> Inner<F> {
         key: &[u8],
         value: &mut [u8],
     ) -> Result<Option<usize>, ReadError<F::Error>> {
-        let r = self.files.read(&mut self.readers[0], file_id).await;
+        let r = self.files.read(&mut self.readers[0], file_id);
         let m = &mut self.files;
         let mut s = FileSearcher::new(r);
 
         let mut key_buf = [0u8; MAX_KEY_SIZE];
+        let mut header = [0; RECORD_HEADER_SIZE];
 
         // Binary search
         let mut ok = s.start(m).await?;
         while ok {
-            let mut header = [0; RECORD_HEADER_SIZE];
             match s.reader().read(m, &mut header).await {
                 Ok(()) => {}
                 Err(PageReadError::Eof) => return Ok(None), // key not present.
@@ -476,7 +496,6 @@ impl<F: Flash> Inner<F> {
 
         // Linear search
         loop {
-            let mut header = [0; RECORD_HEADER_SIZE];
             match r.read(m, &mut header).await {
                 Ok(()) => {}
                 Err(PageReadError::Eof) => return Ok(None), // key not present.
@@ -733,18 +752,13 @@ impl<F: Flash> Inner<F> {
             return Ok(());
         }
 
-        let mut w = self.files.write(&mut self.readers[0], dst).await?;
+        let m = &mut self.files;
+        let mut w = m.write(&mut self.readers[0], dst).await?;
 
         // Open all files in level for reading.
-        // TODO: maybe use a bit less unsafe?
-        let mut r: [MaybeUninit<FileReader>; BRANCHING_FACTOR] = unsafe { MaybeUninit::uninit().assume_init() };
-        let readers_ptr = self.readers.as_mut_ptr();
-        for (i, &file_id) in src.iter().enumerate() {
-            r[i].write(self.files.read(unsafe { &mut *readers_ptr.add(i) }, file_id).await);
-        }
-        let r = unsafe { slice::from_raw_parts_mut(r.as_mut_ptr() as *mut FileReader, src.len()) };
-
-        let m = &mut self.files;
+        let mut r: Vec<FileReader, BRANCHING_FACTOR> = Vec::from_iter(
+            core::iter::zip(&src, &mut self.readers[..]).map(|(&file_id, reader)| m.read(reader, file_id)),
+        );
 
         struct KeySlot {
             valid: bool,
@@ -930,13 +944,17 @@ impl<F: Flash> Inner<F> {
 
     #[cfg(feature = "std")]
     pub async fn dump(&mut self) {
+        info!("============= BEGIN DUMP");
+
+        self.files.dump_pages(&mut self.readers[0]).await;
+
         if let Err(e) = self.files.remount_if_dirty(&mut self.readers[0]).await {
             info!("db is dirty, and remount failed: {:?}", e);
             return;
         }
 
+        info!("File dump:");
         for file_id in 0..FILE_COUNT {
-            info!("====== FILE {} ======", file_id);
             if let Err(e) = self.dump_file(file_id as _).await {
                 info!("failed to dump file: {:?}", e);
             }
@@ -944,10 +962,20 @@ impl<F: Flash> Inner<F> {
     }
 
     #[cfg(feature = "std")]
-    pub async fn dump_file(&mut self, file_id: FileID) -> Result<(), Error<F::Error>> {
+    #[allow(unused)]
+    async fn dump_file_headers(&mut self) {
+        info!("============= BEGIN DUMP");
+
+        for file_id in 0..FILE_COUNT {
+            self.files.dump_file_header(file_id as _);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    async fn dump_file(&mut self, file_id: FileID) -> Result<(), Error<F::Error>> {
         self.files.dump_file(&mut self.readers[0], file_id).await?;
 
-        let mut r = self.files.read(&mut self.readers[0], file_id).await;
+        let mut r = self.files.read(&mut self.readers[0], file_id);
         let mut key = [0u8; MAX_KEY_SIZE];
         let mut value = [0u8; MAX_VALUE_SIZE];
         loop {
@@ -1079,17 +1107,6 @@ impl<I: Iterator> Single for I {
     }
 }
 
-fn no_eof<T>(e: PageReadError<T>) -> Error<T> {
-    match e {
-        PageReadError::Corrupted => Error::Corrupted,
-        #[cfg(not(feature = "_panic-on-corrupted"))]
-        PageReadError::Eof => Error::Corrupted,
-        #[cfg(feature = "_panic-on-corrupted")]
-        PageReadError::Eof => panic!("corrupted"),
-        PageReadError::Flash(x) => Error::Flash(x),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use core::cell::Cell;
@@ -1105,7 +1122,7 @@ mod tests {
     use crate::flash::MemFlash;
 
     async fn check_read(db: &Database<impl Flash, NoopRawMutex>, key: &[u8], value: &[u8]) {
-        let mut rtx = db.read_transaction().await;
+        let rtx = db.read_transaction().await;
         let mut buf = [0; 1024];
         let n = rtx.read(key, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], value);
@@ -1115,7 +1132,7 @@ mod tests {
     where
         F::Error: PartialEq,
     {
-        let mut rtx = db.read_transaction().await;
+        let rtx = db.read_transaction().await;
         assert_eq!(rtx.read(key, &mut []).await, Err(ReadError::KeyNotFound));
     }
 
@@ -1296,7 +1313,7 @@ mod tests {
         let read_state = Cell::new(0);
         let mut read_fut = async {
             read_state.set(1);
-            let mut rtx = db.read_transaction().await;
+            let rtx = db.read_transaction().await;
 
             read_state.set(2);
             yield_now().await;
@@ -1362,7 +1379,7 @@ mod tests {
         let read_state = Cell::new(0);
         let mut read_fut = async {
             read_state.set(1);
-            let mut rtx = db.read_transaction().await;
+            let rtx = db.read_transaction().await;
 
             read_state.set(2);
             yield_now().await;
@@ -1379,7 +1396,7 @@ mod tests {
         let read2_state = Cell::new(0);
         let mut read2_fut = async {
             read2_state.set(1);
-            let mut rtx = db.read_transaction().await;
+            let rtx = db.read_transaction().await;
 
             read2_state.set(2);
 
@@ -1475,7 +1492,7 @@ mod tests {
         wtx.write(b"foo", b"1234").await.unwrap();
         wtx.commit().await.unwrap();
 
-        let mut rtx = db.read_transaction().await;
+        let rtx = db.read_transaction().await;
         let mut buf = [0u8; 1];
         let r = rtx.read(b"foo", &mut buf).await;
         assert!(matches!(r, Err(ReadError::BufferTooSmall)));
@@ -1487,7 +1504,7 @@ mod tests {
 
         let db = Database::<_, NoopRawMutex>::new(&mut f, Config::default());
 
-        let mut rtx = db.read_transaction().await;
+        let rtx = db.read_transaction().await;
         let mut buf = [0u8; 1];
         let r = rtx.read(b"foo", &mut buf).await;
         assert!(matches!(r, Err(ReadError::Corrupted)));

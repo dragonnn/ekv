@@ -14,10 +14,12 @@ Key-value database for embedded systems, for raw NOR flash, using an LSM-Tree.
   - Consistent reads: Read transactions see a consistent snapshot of the database, unaffected by concurrent writes.
   - Unlimited read transactions and one write transaction are allowed concurrently.
   - Read transactions are only blocked by a write transaction commit, not by the whole write transaction. Commit is fast, `O(1)`.
+- Iterating reading keys with a cursor, either all or within a range. Multiple concurrent cursors are supported.
 - Wear leveling: erase cycles are spread out evenly between all flash pages. Pages are allocated cyclically. At boot, a random seed is required to decide which is the first.
 - Corruption-resistant: A corrupted or deliberately manipulated flash image cannot cause crashes, panics or infinite loops, only `Err(Corrupted)` errors.
 - Optional CRC32 protection of headers and data on flash.
 - Extensively tested, using unit tests and fuzzing.
+- Tunable chunk size. Smaller chunks reduce RAM requirements at the expense of doing more and smaller writesand spending a bit more flash space in chunk headers with CRCs.
 
 ## Current status
 
@@ -33,14 +35,14 @@ The on-disk format is **not stable** yet.
 - Optimize tiny write transactions: append to the last file if possible, instead of starting a new one. Currently each write transaction opens a new file, which will have to erase at least one full page, even if the transaction writes just one small key. It is recommended to batch multiple writes in a single transaction
 for performance.
 - Support access align higher than 4. Currently reads/writes are (optionally) aligned up to 4 bytes. Some flash out there can only be written in 8-byte words or higher.
-- Add a max chunk size, to reduce the RAM requirement in PageReader.
 - Allow writes within a transaction to be unsorted.
 - Allow reads within a write transaction. They should see the the not yet committed writes in the current transaction.
-- Allow iterating the records in the database.
 - Add optional encryption + authentication support (which disables CRCs)
 - Integrate with `embedded-storage`.
 
 ## Alternatives
+
+`ekv` works best for datasets with large amounts of keys (>1000), where its `O(log n)` complexity outperforms linear search. For datasets with less keys, other key-value databases based on linear search (such as `sequential-storage`) will be faster.
 
 - If the dataset fits in RAM, you could read/write it all at once. Either making it `repr(C)` and transmuting, or serializing it with some compact `serde` flavor such as [`postcard`](https://docs.rs/postcard)
 - [sequential-storage](https://docs.rs/sequential-storage) - Rust. Linear search. No multi-key transactions. Multiple single-key transactions can be written to the same page, unlike `ekv`.
@@ -60,4 +62,3 @@ This work is licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 at your option.
-

@@ -4,12 +4,12 @@ use core::mem::size_of;
 #[cfg(feature = "alloc")]
 use system_alloc::boxed::Box;
 
-use crate::config::*;
+use crate::config::{self, ALIGN, ERASE_VALUE, MAX_HEADER_SIZE, PAGE_SIZE};
 use crate::errors::Error;
 use crate::flash::Flash;
 use crate::types::PageID;
 
-const CHUNK_MAGIC: u16 = 0x58A4;
+const CHUNK_MAGIC: u16 = 0x59B4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
@@ -56,7 +56,11 @@ pub unsafe trait Header: Sized {
     const MAGIC: u32;
 }
 
-pub const MAX_CHUNK_SIZE: usize = PAGE_SIZE - PageHeader::SIZE - ChunkHeader::SIZE;
+const MAX_CHUNK_SIZE: usize = if config::MAX_CHUNK_SIZE > (PAGE_SIZE - PageHeader::SIZE - ChunkHeader::SIZE) {
+    PAGE_SIZE - PageHeader::SIZE - ChunkHeader::SIZE
+} else {
+    config::MAX_CHUNK_SIZE
+};
 
 async fn write_header<F: Flash, H: Header>(flash: &mut F, page_id: PageID, header: H) -> Result<(), F::Error> {
     assert!(size_of::<H>() <= MAX_HEADER_SIZE);
@@ -108,7 +112,8 @@ pub async fn read_header<F: Flash, H: Header>(flash: &mut F, page_id: PageID) ->
     Ok(header)
 }
 
-pub struct ChunkIter {
+#[derive(Clone)]
+struct ChunkIter {
     page_id: PageID,
 
     /// true if we've reached the end of the page.
@@ -180,6 +185,12 @@ pub struct PageReader {
     buf: [u8; MAX_CHUNK_SIZE],
 }
 
+#[derive(Clone)]
+pub struct DehydratedPageReader {
+    ch: ChunkIter,
+    chunk_pos: usize,
+}
+
 impl PageReader {
     pub const fn new() -> Self {
         PageReader {
@@ -200,6 +211,23 @@ impl PageReader {
         }
     }
 
+    pub fn dehydrate(&self) -> DehydratedPageReader {
+        DehydratedPageReader {
+            ch: self.ch.clone(),
+            chunk_pos: self.chunk_pos,
+        }
+    }
+
+    pub async fn rehydrate_from<F: Flash>(
+        &mut self,
+        flash: &mut F,
+        dehydrated: &DehydratedPageReader,
+    ) -> Result<(), Error<F::Error>> {
+        self.ch = dehydrated.ch.clone();
+        self.chunk_pos = dehydrated.chunk_pos;
+        self.load_chunk(flash).await
+    }
+
     pub async fn open<F: Flash, H: Header>(&mut self, flash: &mut F, page_id: PageID) -> Result<H, Error<F::Error>> {
         trace!("page: read {:?}", page_id);
         let header = read_header(flash, page_id).await?;
@@ -209,14 +237,13 @@ impl PageReader {
         self.ch.at_end = false;
         self.ch.chunk_offset = PageHeader::SIZE + size_of::<H>();
         self.ch.chunk_len = 0;
-        self.chunk_pos = 0;
         self.ch.open_chunk(flash).await?;
+        self.chunk_pos = 0;
         self.load_chunk(flash).await?;
         Ok(header)
     }
 
     async fn load_chunk<F: Flash>(&mut self, flash: &mut F) -> Result<(), Error<F::Error>> {
-        self.chunk_pos = 0;
         let n = align_up(self.ch.chunk_len);
 
         #[cfg(feature = "alloc")]
@@ -252,6 +279,7 @@ impl PageReader {
         if !self.ch.next_chunk(flash).await? {
             return Ok(false);
         }
+        self.chunk_pos = 0;
         self.load_chunk(flash).await?;
         Ok(true)
     }
@@ -990,6 +1018,152 @@ mod tests {
         assert_eq!(n, 9);
         assert_eq!(buf[..9], [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_hydration() {
+        let f = &mut MemFlash::new();
+
+        // Write
+        let mut w = PageWriter::new();
+        w.open(f, PAGE).await;
+        let n = w
+            .write(f, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
+            .await
+            .unwrap();
+        assert_eq!(n, 17);
+        w.write_header(f, HEADER).await.unwrap();
+        w.commit(f).await.unwrap();
+
+        // Read
+        let mut r = PageReader::new();
+        let h = r.open::<_, TestHeader>(f, PAGE).await.unwrap();
+        assert_eq!(h, HEADER);
+        let mut buf = vec![0; MAX_PAYLOAD];
+
+        let dehydrated_start = r.dehydrate();
+
+        let n = r.read(f, &mut buf[..5]).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(buf[..5], [1, 2, 3, 4, 5]);
+
+        let dehydrated_middle = r.dehydrate();
+
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(buf[..12], [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+
+        let dehydrated_end = r.dehydrate();
+
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_start).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 17);
+        assert_eq!(buf[..17], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+
+        r.rehydrate_from(f, &dehydrated_middle).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(buf[..12], [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_end).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_hydration_multichunk() {
+        let f = &mut MemFlash::new();
+
+        // Write
+        let mut w = PageWriter::new();
+        w.open(f, PAGE).await;
+        let n = w.write(f, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).await.unwrap();
+        assert_eq!(n, 9);
+        w.write_header(f, HEADER).await.unwrap();
+        w.commit(f).await.unwrap();
+
+        w.open_append(f, PAGE).await.unwrap();
+        let n = w.write(f, &[10, 11, 12, 13, 14, 15, 16, 17]).await.unwrap();
+        assert_eq!(n, 8);
+        w.commit(f).await.unwrap();
+
+        // Read
+        let mut r = PageReader::new();
+        let h = r.open::<_, TestHeader>(f, PAGE).await.unwrap();
+        assert_eq!(h, HEADER);
+        let mut buf = vec![0; MAX_PAYLOAD];
+
+        let dehydrated_start = r.dehydrate();
+
+        let n = r.read(f, &mut buf[..5]).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(buf[..5], [1, 2, 3, 4, 5]);
+
+        let dehydrated_middle_chunk1 = r.dehydrate();
+
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(buf[..4], [6, 7, 8, 9]);
+
+        let dehydrated_middle = r.dehydrate();
+
+        let n = r.read(f, &mut buf[..4]).await.unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(buf[..4], [10, 11, 12, 13]);
+
+        let dehydrated_middle_chunk2 = r.dehydrate();
+
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(buf[..4], [14, 15, 16, 17]);
+
+        let dehydrated_end = r.dehydrate();
+
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_start).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 9);
+        assert_eq!(buf[..9], [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(buf[..8], [10, 11, 12, 13, 14, 15, 16, 17]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_middle_chunk1).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(buf[..4], [6, 7, 8, 9]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(buf[..8], [10, 11, 12, 13, 14, 15, 16, 17]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_middle).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(buf[..8], [10, 11, 12, 13, 14, 15, 16, 17]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_middle_chunk2).await.unwrap();
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(buf[..4], [14, 15, 16, 17]);
+        let n = r.read(f, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        r.rehydrate_from(f, &dehydrated_end).await.unwrap();
         let n = r.read(f, &mut buf).await.unwrap();
         assert_eq!(n, 0);
     }
