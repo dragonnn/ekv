@@ -9,7 +9,7 @@ use crate::errors::Error;
 use crate::flash::Flash;
 use crate::types::PageID;
 
-const CHUNK_MAGIC: u16 = 0x59B4;
+const CHUNK_MAGIC: u16 = 0x59C5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
@@ -56,7 +56,8 @@ pub unsafe trait Header: Sized {
     const MAGIC: u32;
 }
 
-const MAX_CHUNK_SIZE: usize = if config::MAX_CHUNK_SIZE > (PAGE_SIZE - PageHeader::SIZE - ChunkHeader::SIZE) {
+pub(crate) const MAX_CHUNK_SIZE: usize = if config::MAX_CHUNK_SIZE > (PAGE_SIZE - PageHeader::SIZE - ChunkHeader::SIZE)
+{
     PAGE_SIZE - PageHeader::SIZE - ChunkHeader::SIZE
 } else {
     config::MAX_CHUNK_SIZE
@@ -154,9 +155,14 @@ impl ChunkIter {
             return Ok(false);
         }
 
+        if header.len as usize > MAX_CHUNK_SIZE {
+            corrupted!();
+        }
+
         let Some(data_end) = data_start.checked_add(header.len as usize) else {
-            corrupted!()
+            corrupted!();
         };
+
         if data_end > PAGE_SIZE {
             corrupted!();
         }
@@ -255,6 +261,8 @@ impl PageReader {
         };
         #[cfg(not(feature = "alloc"))]
         let buf = &mut self.buf;
+        assert!(n <= MAX_CHUNK_SIZE);
+
         flash
             .read(
                 self.ch.page_id as _,
@@ -288,10 +296,12 @@ impl PageReader {
         self.ch.page_id
     }
 
+    /// Read up to data.len() bytes of data or until the end of the current chunk.
+    ///
+    /// May return less bytes than the buffer if not available.
     pub async fn read<F: Flash>(&mut self, flash: &mut F, data: &mut [u8]) -> Result<usize, Error<F::Error>> {
         trace!("PageReader({:?}): read({})", self.ch.page_id, data.len());
-
-        if self.ch.at_end || data.is_empty() {
+        if self.is_at_eof(flash).await? || data.is_empty() {
             trace!("read: at end or zero len");
             return Ok(0);
         }
@@ -322,26 +332,32 @@ impl PageReader {
         Ok(n)
     }
 
-    pub async fn skip<F: Flash>(&mut self, flash: &mut F, len: usize) -> Result<usize, Error<F::Error>> {
+    /// Skip up to len bytes in the reader or until the end of the last chunk
+    ///
+    /// Skips across chunks within the page.
+    pub async fn skip<F: Flash>(&mut self, flash: &mut F, mut len: usize) -> Result<usize, Error<F::Error>> {
         trace!("PageReader({:?}): skip({})", self.ch.page_id, len);
         if self.ch.at_end || len == 0 {
             trace!("skip: at end or zero len");
             return Ok(0);
         }
 
-        if self.chunk_pos == self.ch.chunk_len {
-            trace!("skip: at end of chunk");
-            if !self.next_chunk(flash).await? {
+        let start = len;
+        loop {
+            if self.is_at_eof(flash).await? {
                 trace!("skip: no next chunk, we're at end.");
-                return Ok(0);
+                return Ok(start - len);
+            }
+
+            let n = len.min(self.ch.chunk_len - self.chunk_pos);
+            self.ch.prev_chunks_len += n;
+            self.chunk_pos += n;
+            len -= n;
+            if len == 0 {
+                trace!("skip: done, n={}", start - len);
+                return Ok(start - len);
             }
         }
-
-        let n = len.min(self.ch.chunk_len - self.chunk_pos);
-        self.ch.prev_chunks_len += n;
-        self.chunk_pos += n;
-        trace!("skip: done, n={}", n);
-        Ok(n)
     }
 
     pub async fn is_at_eof<F: Flash>(&mut self, flash: &mut F) -> Result<bool, Error<F::Error>> {
@@ -469,10 +485,17 @@ impl<H: Header> PageWriter<H> {
         self.page_id
     }
 
+    fn is_chunk_full(&self) -> bool {
+        self.chunk_pos >= MAX_CHUNK_SIZE
+    }
+
+    /// Write n bytes of data to the page.
+    ///
+    /// If the current chunk is full, it will commit it.
     pub async fn write<F: Flash>(&mut self, flash: &mut F, data: &[u8]) -> Result<usize, Error<F::Error>> {
         let max_write = PAGE_SIZE
             .saturating_sub(self.chunk_offset + ChunkHeader::SIZE + self.chunk_pos)
-            .min(MAX_CHUNK_SIZE);
+            .min(MAX_CHUNK_SIZE.saturating_sub(self.chunk_pos));
         let total_n = data.len().min(max_write);
         if total_n == 0 {
             return Ok(0);
@@ -527,6 +550,10 @@ impl<H: Header> PageWriter<H> {
         self.total_pos += n;
         self.chunk_pos += n;
 
+        if self.is_chunk_full() {
+            self.commit(flash).await?;
+        }
+
         Ok(total_n)
     }
 
@@ -551,7 +578,6 @@ impl<H: Header> PageWriter<H> {
             // nothing to commit.
             return Ok(());
         }
-
         self.erase_if_needed(flash).await.map_err(Error::Flash)?;
 
         // flush align buf.
@@ -573,6 +599,7 @@ impl<H: Header> PageWriter<H> {
             #[cfg(feature = "crc")]
             crc: self.crc.finish(),
         };
+
         flash
             .write(self.page_id as _, self.chunk_offset, &h.to_bytes())
             .await

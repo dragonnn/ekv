@@ -10,7 +10,15 @@ pub use crate::page::ReadError;
 use crate::page::{ChunkHeader, DehydratedPageReader, Header, PageHeader, PageReader, PageWriter};
 use crate::types::{OptionPageID, PageID};
 
-pub const PAGE_MAX_PAYLOAD_SIZE: usize = PAGE_SIZE - PageHeader::SIZE - size_of::<DataHeader>() - ChunkHeader::SIZE;
+// Number of chunks + chunk headers per page.
+const CHUNKS_PER_PAGE: usize =
+    (PAGE_SIZE - PageHeader::SIZE - size_of::<DataHeader>()) / (page::MAX_CHUNK_SIZE + ChunkHeader::SIZE);
+// Size of the last chunk + chunk header.
+const CHUNKS_REMAINDER: usize =
+    (PAGE_SIZE - PageHeader::SIZE - size_of::<DataHeader>()) % (page::MAX_CHUNK_SIZE + ChunkHeader::SIZE);
+// Bytes in max chunks + remainder chunk without the last chunk header.
+pub const PAGE_MAX_PAYLOAD_SIZE: usize =
+    (CHUNKS_PER_PAGE * page::MAX_CHUNK_SIZE) + CHUNKS_REMAINDER.saturating_sub(ChunkHeader::SIZE);
 
 pub type FileID = u8;
 
@@ -28,7 +36,7 @@ pub struct MetaHeader {
 }
 
 unsafe impl page::Header for MetaHeader {
-    const MAGIC: u32 = 0x1d81bccc;
+    const MAGIC: u32 = 0x1d81bcde;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,7 +56,7 @@ pub struct DataHeader {
 }
 
 unsafe impl page::Header for DataHeader {
-    const MAGIC: u32 = 0x7fcbf25c;
+    const MAGIC: u32 = 0x7fcbf35d;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +101,7 @@ pub struct FileManager<F: Flash> {
 
 impl<F: Flash> FileManager<F> {
     pub fn new(flash: F, random_seed: u32) -> Self {
+        assert!(FILE_COUNT * FileMeta::SIZE <= page::MAX_CHUNK_SIZE);
         Self {
             flash,
             random: random_seed,
@@ -310,6 +319,7 @@ impl<F: Flash> FileManager<F> {
                 .inspect_err(|_| {
                     debug!("read_page failed: last_page_id={:?} file_id={}", last_page_id, file_id);
                 })?;
+
             let page_len = r.skip(&mut self.flash, PAGE_SIZE).await?;
             let last_seq = h.seq.add(page_len)?;
 
@@ -1577,6 +1587,9 @@ mod tests {
     use crate::flash::MemFlash;
     use crate::types::RawPageID;
 
+    /// Big amount of data that it's reasonable to write to a file.
+    const BIG_DATA_SIZE: usize = PAGE_SIZE * MAX_PAGE_COUNT / 2;
+
     fn page(p: RawPageID) -> PageID {
         PageID::from_raw(p).unwrap()
     }
@@ -1617,7 +1630,7 @@ mod tests {
         m.format().await.unwrap();
         m.mount(&mut pr).await.unwrap();
 
-        let data = dummy_data(23456);
+        let data = dummy_data(BIG_DATA_SIZE);
 
         let mut w = m.write(&mut pr, 0).await.unwrap();
         w.write(&mut m, &data).await.unwrap();
@@ -2642,7 +2655,7 @@ mod tests {
         m.mount(&mut pr).await.unwrap();
 
         let mut w = m.write(&mut pr, 1).await.unwrap();
-        w.write(&mut m, &[0x00; 4348]).await.unwrap();
+        w.write(&mut m, &[0x00; BIG_DATA_SIZE]).await.unwrap();
         w.record_end();
         m.commit(&mut w).await.unwrap();
 
@@ -2661,10 +2674,12 @@ mod tests {
         m.format().await.unwrap();
         m.mount(&mut pr).await.unwrap();
 
+        const N: usize = BIG_DATA_SIZE / 2;
+
         let mut w = m.write(&mut pr, 1).await.unwrap();
-        w.write(&mut m, &[0x00; 4348]).await.unwrap();
+        w.write(&mut m, &[0x00; N]).await.unwrap();
         w.record_end();
-        w.write(&mut m, &[0x00; 4348]).await.unwrap();
+        w.write(&mut m, &[0x00; N]).await.unwrap();
         w.record_end();
         m.commit(&mut w).await.unwrap();
 
@@ -2672,7 +2687,7 @@ mod tests {
         // Seek left
         let mut s = FileSearcher::new(m.read(&mut pr, 1));
         assert_eq!(s.start(&mut m).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Left).await.unwrap(), false);
         assert_eq!(s.reader().offset(&mut m), 0);
@@ -2680,10 +2695,10 @@ mod tests {
         // Seek right
         let mut s = FileSearcher::new(m.read(&mut pr, 1));
         assert_eq!(s.start(&mut m).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Right).await.unwrap(), false);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
     }
 
     #[test_log::test(tokio::test)]
@@ -2694,12 +2709,14 @@ mod tests {
         m.format().await.unwrap();
         m.mount(&mut pr).await.unwrap();
 
+        const N: usize = BIG_DATA_SIZE / 3;
+
         let mut w = m.write(&mut pr, 1).await.unwrap();
-        w.write(&mut m, &[0x00; 4348]).await.unwrap();
+        w.write(&mut m, &[0x00; N]).await.unwrap();
         w.record_end();
-        w.write(&mut m, &[0x00; 4348]).await.unwrap();
+        w.write(&mut m, &[0x00; N]).await.unwrap();
         w.record_end();
-        w.write(&mut m, &[0x00; 4348]).await.unwrap();
+        w.write(&mut m, &[0x00; N]).await.unwrap();
         w.record_end();
         m.commit(&mut w).await.unwrap();
 
@@ -2707,10 +2724,10 @@ mod tests {
         // Seek left
         let mut s = FileSearcher::new(m.read(&mut pr, 1));
         assert_eq!(s.start(&mut m).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 8696);
+        assert_eq!(s.reader().offset(&mut m), N * 2);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Left).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Left).await.unwrap(), false);
         assert_eq!(s.reader().offset(&mut m), 0);
@@ -2718,10 +2735,10 @@ mod tests {
         // Seek less left
         let mut s = FileSearcher::new(m.read(&mut pr, 1));
         assert_eq!(s.start(&mut m).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 8696);
+        assert_eq!(s.reader().offset(&mut m), N * 2);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Left).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Left).await.unwrap(), false);
         assert_eq!(s.reader().offset(&mut m), 0);
@@ -2729,21 +2746,21 @@ mod tests {
         // Seek middle
         let mut s = FileSearcher::new(m.read(&mut pr, 1));
         assert_eq!(s.start(&mut m).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 8696);
+        assert_eq!(s.reader().offset(&mut m), N * 2);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Left).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Right).await.unwrap(), false);
-        assert_eq!(s.reader().offset(&mut m), 4348);
+        assert_eq!(s.reader().offset(&mut m), N);
 
         // Seek right
         let mut s = FileSearcher::new(m.read(&mut pr, 1));
         assert_eq!(s.start(&mut m).await.unwrap(), true);
-        assert_eq!(s.reader().offset(&mut m), 8696);
+        assert_eq!(s.reader().offset(&mut m), N * 2);
         s.reader().read(&mut m, &mut buf).await.unwrap();
         assert_eq!(s.seek(&mut m, SeekDirection::Right).await.unwrap(), false);
-        assert_eq!(s.reader().offset(&mut m), 8696);
+        assert_eq!(s.reader().offset(&mut m), N * 2);
     }
 
     #[test_log::test(tokio::test)]
@@ -2804,7 +2821,7 @@ mod tests {
         m.format().await.unwrap();
         m.mount(&mut pr).await.unwrap();
 
-        let count: u32 = 20000 / 4;
+        let count: u32 = (BIG_DATA_SIZE / 4).try_into().unwrap();
 
         let mut w = m.write(&mut pr, 1).await.unwrap();
         for i in 1..=count {

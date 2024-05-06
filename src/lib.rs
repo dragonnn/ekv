@@ -5,6 +5,7 @@
 #![allow(async_fn_in_trait)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::new_without_default)]
+#![allow(clippy::modulo_one)] // needed when ALIGN=1
 // the `_test` feature makes public more stuff, causing bogus warnings.
 #![cfg_attr(not(feature = "_test"), warn(missing_docs))]
 #[cfg(feature = "alloc")]
@@ -22,7 +23,7 @@ mod errors;
 pub mod flash;
 mod types;
 
-pub use cursor::{Bound, Cursor};
+pub use cursor::Cursor;
 pub use errors::{CommitError, FormatError, MountError, ReadError, WriteError};
 pub use record::{Config, Database, ReadTransaction, WriteTransaction};
 
