@@ -1,10 +1,13 @@
 use crate::file::SearchSeekError;
 use crate::page::ReadError as PageReadError;
 
+/// Error returned by [`ReadTransaction::read_all`](crate::ReadTransaction::read_all),  [`ReadTransaction::read_range`](crate::ReadTransaction::read_range).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error<E> {
+    /// Database is corrupted.
     Corrupted,
+    /// Error from the underlying flash.
     Flash(E),
 }
 
@@ -147,7 +150,7 @@ impl<E> From<Error<E>> for CursorError<E> {
 /// Database is corrupted, or not formatted yet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct CorruptedError;
+pub(crate) struct CorruptedError;
 
 impl<E> From<CorruptedError> for Error<E> {
     fn from(_: CorruptedError) -> Self {
