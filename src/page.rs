@@ -255,7 +255,7 @@ impl PageReader {
         #[cfg(feature = "alloc")]
         let buf = {
             if self.buf.is_none() {
-                self.buf = Some(Box::new([0u8; MAX_CHUNK_SIZE]));
+                self.buf = Some(unsafe { Box::new_zeroed().assume_init() });
             }
             unsafe { self.buf.as_mut().unwrap_unchecked() }
         };
@@ -316,7 +316,7 @@ impl PageReader {
         #[cfg(feature = "alloc")]
         let buf = {
             if self.buf.is_none() {
-                self.buf = Some(Box::new([0u8; MAX_CHUNK_SIZE]));
+                self.buf = Some(unsafe { Box::new_zeroed().assume_init() });
             }
             unsafe { self.buf.as_mut().unwrap_unchecked() }
         };
